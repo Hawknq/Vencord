@@ -27,7 +27,42 @@ import { ChannelStore, GuildMemberStore, GuildRoleStore, GuildStore } from "@web
 
 const useMessageAuthor = findByCodeLazy('"Result cannot be null because the message is not null"');
 
+const logger = new Logger("RoleColorEverywhere");
+
+/** Runs fn and logs instead of throwing, so a failure never breaks Discord's rendering. */
+function safe<T>(label: string, fn: () => T): T | undefined {
+    try {
+        return fn();
+    } catch (e) {
+        logger.error(label, e);
+    }
+}
+
+// Parses "123, 456 789" style lists into a Set of IDs. Cached by raw string so it only re-parses when the setting changes.
+const cachedRaw: Record<string, string> = {};
+const cachedSets: Record<string, Set<string>> = {};
+function getIdSet(key: "excludedUserIds" | "excludedRoleIds") {
+    const raw: string = settings.store[key] ?? "";
+    if (cachedRaw[key] !== raw) {
+        cachedRaw[key] = raw;
+        cachedSets[key] = new Set(raw.split(/[\s,;]+/).filter(Boolean));
+    }
+    return cachedSets[key];
+}
+
+function isExcluded(userId: string | undefined, member: GuildMember | null | undefined) {
+    const users = getIdSet("excludedUserIds");
+    if (userId && users.has(userId)) return true;
+
+    const roles = getIdSet("excludedRoleIds");
+    if (roles.size && member?.roles?.some(id => roles.has(id))) return true;
+
+    return false;
+}
+
 function getGradientColors(guildId: string, colorStrings: GuildMember["colorStrings"]) {
+    if (!settings.store.gradientColors) return null;
+
     const guild = GuildStore.getGuild(guildId);
     if (!guild || !hasGuildFeature(guild, "ENHANCED_ROLE_COLORS") || !colorStrings?.secondaryColor) return null;
 
@@ -41,11 +76,14 @@ function makeColorStyle(guildId: string, { colorString, colorStrings }: Pick<Gui
     const { primaryColor, secondaryColor, tertiaryColor } = gradient;
     const colors = [primaryColor, secondaryColor, tertiaryColor, primaryColor].filter(Boolean).join(",");
 
+    // Do NOT use the `background` shorthand here: when React updates styles it can reset
+    // `backgroundClip`, which makes the gradient fill the whole box instead of only the text.
     return {
         color: primaryColor,
-        background: `linear-gradient(to right,${colors})`,
-        backgroundClip: "text",
+        backgroundImage: `linear-gradient(to right,${colors})`,
         backgroundSize: "100px auto",
+        backgroundClip: "text",
+        WebkitBackgroundClip: "text",
         WebkitTextFillColor: "transparent"
     };
 }
@@ -91,11 +129,25 @@ const settings = definePluginSettings({
         type: OptionType.SLIDER,
         description: "Intensity of message coloring.",
         markers: makeRange(0, 100, 10),
-        default: 30
+        default: 30,
+        disabled: () => !settings.store.colorChatMessages
+    },
+    gradientColors: {
+        type: OptionType.BOOLEAN,
+        default: true,
+        description: "Use gradient colors for roles with Enhanced Role Colors. If turned off, only the primary color is used"
+    },
+    excludedUserIds: {
+        type: OptionType.STRING,
+        default: "",
+        description: "User IDs that should NOT get role colors (separated by comma, space or semicolon)"
+    },
+    excludedRoleIds: {
+        type: OptionType.STRING,
+        default: "",
+        description: "Role IDs that should NOT get role colors. Members with any of these roles are skipped (separated by comma, space or semicolon)"
     }
 });
-
-const logger = new Logger("RoleColorEverywhere");
 
 export default definePlugin({
     name: "RoleColorEverywhere",
@@ -156,7 +208,7 @@ export default definePlugin({
             replacement: [
                 {
                     match: /#{intl::GUEST_NAME_SUFFIX}.{0,50}?""\](?<=guildId:(\i),.+?user:(\i).+?)/,
-                    replace: "$&,style:$self.getColorStyle($2.id,$1),"
+                    replace: "$&,style:$self.getColorStyle($2?.id,$1),"
                 }
             ],
             predicate: () => settings.store.voiceUsers
@@ -190,77 +242,83 @@ export default definePlugin({
         }
     ],
 
+    /**
+     * Resolves the guild member for a user in a channel or guild.
+     * Returns null when it can't be resolved or the user/role is on the exclusion lists.
+     */
     getMember(userId: string, channelOrGuildId: string) {
-        try {
+        return safe("Failed to get member", () => {
+            if (userId == null || channelOrGuildId == null) return null;
+
             const guildId = ChannelStore.getChannel(channelOrGuildId)?.guild_id ?? GuildStore.getGuild(channelOrGuildId)?.id;
             if (guildId == null) return null;
 
             const member = GuildMemberStore.getMember(guildId, userId);
-            return member && { guildId, member };
-        } catch (e) {
-            logger.error("Failed to get member", e);
-        }
+            if (!member || isExcluded(userId, member)) return null;
 
-        return null;
+            return { guildId, member };
+        }) ?? null;
     },
 
-    getColorInt(userId: string, channelOrGuildId: string) {
-        try {
+    /** Always returns a number or undefined (never "" or null). */
+    getColorInt(userId: string, channelOrGuildId: string): number | undefined {
+        return safe("Failed to get color int", () => {
             const colorString = this.getMember(userId, channelOrGuildId)?.member.colorString;
-            return colorString && parseInt(colorString.slice(1), 16);
-        } catch (e) {
-            logger.error(e);
-        }
+            if (!colorString) return undefined;
+
+            const int = parseInt(colorString.slice(1), 16);
+            return Number.isNaN(int) ? undefined : int;
+        });
     },
 
     getRoleColors(userId: string, channelOrGuildId: string) {
-        try {
+        return safe("Failed to get role colors", () => {
             const data = this.getMember(userId, channelOrGuildId);
             return data && getGradientColors(data.guildId, data.member.colorStrings);
-        } catch (e) {
-            logger.error(e);
-        }
+        });
     },
 
     getColorStyle(userId: string, channelOrGuildId: string) {
-        try {
+        return safe("Failed to get color style", () => {
             const data = this.getMember(userId, channelOrGuildId);
             return data && makeColorStyle(data.guildId, data.member);
-        } catch (e) {
-            logger.error(e);
-        }
+        });
     },
 
     useMessageColorsStyle(message: any) {
-        try {
-            const { messageSaturation } = settings.use(["messageSaturation"]);
-            const author = useMessageAuthor(message);
+        // Hooks must always run in the same order, so call them before any early return.
+        const { messageSaturation } = settings.use(["messageSaturation"]);
+        const author = safe("Failed to get message author", () => useMessageAuthor(message));
 
+        return safe("Failed to get message color", () => {
             // Do not apply role color if the send fails, otherwise it becomes indistinguishable
-            if (message.state === "SEND_FAILED") return;
+            if (message.state === "SEND_FAILED") return null;
+            if (author?.colorString == null || messageSaturation === 0) return null;
 
-            if (author.colorString != null && messageSaturation !== 0) {
-                const value = `color-mix(in oklab, ${author.colorString} ${messageSaturation}%, var({DEFAULT}))`;
+            // Respect the exclusion lists (user IDs and role IDs)
+            const userId: string | undefined = message.author?.id;
+            const guildId = message.channel_id ? ChannelStore.getChannel(message.channel_id)?.guild_id : undefined;
+            const member = userId && guildId ? GuildMemberStore.getMember(guildId, userId) : null;
+            if (isExcluded(userId, member)) return null;
 
-                return {
-                    color: value.replace("{DEFAULT}", "--text-default"),
-                    "--text-strong": value.replace("{DEFAULT}", "--text-strong"),
-                    "--text-muted": value.replace("{DEFAULT}", "--text-muted")
-                };
-            }
-        } catch (e) {
-            logger.error("Failed to get message color", e);
-        }
+            const value = `color-mix(in oklab, ${author.colorString} ${messageSaturation}%, var({DEFAULT}))`;
 
-        return null;
+            return {
+                color: value.replace("{DEFAULT}", "--text-default"),
+                "--text-strong": value.replace("{DEFAULT}", "--text-strong"),
+                "--text-muted": value.replace("{DEFAULT}", "--text-muted")
+            };
+        }) ?? null;
     },
 
     getRoleStyle(props: any) {
-        try {
-            const role = GuildRoleStore.getRole(props?.guildId, props?.id);
+        if (!props) return undefined;
+
+        return safe("Failed to get role style", () => {
+            if (getIdSet("excludedRoleIds").has(props.id)) return undefined;
+
+            const role = GuildRoleStore.getRole(props.guildId, props.id);
             return role && makeColorStyle(props.guildId, role);
-        } catch (e) {
-            logger.error("Failed to get role style", e);
-        }
+        });
     }
 });
